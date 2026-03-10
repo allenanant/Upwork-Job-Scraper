@@ -8,6 +8,7 @@ import {
 	settingsStorage,
 } from "./storage";
 import type {
+	ClientProfile,
 	Job,
 	LegacyWebhookJob,
 	ScrapeResult,
@@ -341,6 +342,98 @@ async function scrapeTarget(target: SearchTarget): Promise<ScrapeResult> {
 	}
 }
 
+async function enrichJobWithClientProfile(job: Job): Promise<Job> {
+	let tabIdToRemove: number | undefined;
+
+	try {
+		if (!job.url) return job;
+
+		const windowId = await resolveWindowIdForBackgroundTab();
+		const tab = (await browser.tabs.create({
+			url: job.url,
+			active: false,
+			...(windowId !== undefined ? { windowId } : {}),
+		})) as unknown as { id?: number };
+
+		if (!tab.id) return job;
+		const tabId = tab.id;
+		tabIdToRemove = tabId;
+
+		const { origin, pathname } = new URL(job.url);
+		const expectedBase = origin + pathname;
+
+		await waitForTabComplete(tabId, expectedBase);
+
+		// Wait for the page content to render (Upwork is an SPA)
+		await executeScriptWithFrameRetry(() =>
+			browser.scripting.executeScript({
+				target: { tabId },
+				func: () =>
+					new Promise<boolean>((resolve) => {
+						const deadline = Date.now() + 8_000;
+						const check = () => {
+							const hasClientSection =
+								document.body?.innerText?.includes("About the") ||
+								document.querySelector('[data-qa*="client"]') !== null;
+							if (hasClientSection || Date.now() >= deadline) {
+								resolve(hasClientSection);
+							} else {
+								setTimeout(check, 500);
+							}
+						};
+						check();
+					}),
+			}),
+		);
+
+		const results = await executeScriptWithFrameRetry(() =>
+			browser.scripting.executeScript({
+				target: { tabId },
+				files: ["content-scripts/upwork-client-info.js"],
+			}),
+		);
+
+		const clientProfile = results?.[0]?.result as
+			| ClientProfile
+			| undefined;
+
+		if (clientProfile) {
+			return {
+				...job,
+				clientName: clientProfile.clientName || undefined,
+				clientLocation: clientProfile.clientLocation || undefined,
+				clientCompanyUrl: clientProfile.clientCompanyUrl || undefined,
+				clientMemberSince: clientProfile.clientMemberSince || undefined,
+				clientJobsPosted: clientProfile.clientJobsPosted || undefined,
+				clientHireRate: clientProfile.clientHireRate || undefined,
+			};
+		}
+
+		return job;
+	} catch (error) {
+		console.error(
+			`[Upwork Scraper] Client profile enrichment failed for ${job.url}:`,
+			error,
+		);
+		return job;
+	} finally {
+		if (tabIdToRemove !== undefined) {
+			browser.tabs.remove(tabIdToRemove).catch(() => {});
+		}
+	}
+}
+
+async function enrichNewJobsWithClientProfiles(jobs: Job[]): Promise<Job[]> {
+	const enriched: Job[] = [];
+	for (const job of jobs) {
+		const enrichedJob = await enrichJobWithClientProfile(job);
+		enriched.push(enrichedJob);
+		// Small delay between requests to avoid detection
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+	}
+	return enriched;
+}
+
 async function processTargetResult(
 	target: SearchTarget,
 	result: ScrapeResult,
@@ -415,11 +508,14 @@ async function processTargetResult(
 
 	if (newJobs.length === 0) return 0;
 
+	// Enrich new jobs with client profile data from job detail pages
+	const enrichedNewJobs = await enrichNewJobsWithClientProfiles(newJobs);
+
 	if (target.webhookEnabled && target.webhookUrl) {
 		const useLegacyPayload = shouldUseLegacyPayload(target);
-		const webhookJobs = newJobs.map(toWebhookJob);
+		const webhookJobs = enrichedNewJobs.map(toWebhookJob);
 		const requestBody = useLegacyPayload
-			? JSON.stringify(newJobs.map((job) => toLegacyWebhookJob(job, target)))
+			? JSON.stringify(enrichedNewJobs.map((job) => toLegacyWebhookJob(job, target)))
 			: JSON.stringify({
 					status: "success",
 					targetName: target.name,
@@ -474,7 +570,7 @@ async function processTargetResult(
 	}
 
 	if (notificationsEnabled) {
-		for (const job of newJobs.slice(0, 3)) {
+		for (const job of enrichedNewJobs.slice(0, 3)) {
 			browser.notifications.create({
 				type: "basic",
 				iconUrl: "/icon/128.png",

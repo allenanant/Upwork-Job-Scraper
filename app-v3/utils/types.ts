@@ -20,6 +20,21 @@ export interface Job {
   clientTotalSpent: string;
   proposals: string;
   scrapedAt: string;
+  clientName?: string;
+  clientLocation?: string;
+  clientCompanyUrl?: string;
+  clientMemberSince?: string;
+  clientJobsPosted?: string;
+  clientHireRate?: string;
+}
+
+export interface ClientProfile {
+  clientName: string;
+  clientLocation: string;
+  clientCompanyUrl: string;
+  clientMemberSince: string;
+  clientJobsPosted: string;
+  clientHireRate: string;
 }
 
 export interface WebhookJob extends Job {
